@@ -3,15 +3,17 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 typedef struct mem_profile_t mem_profile_t;
 
-typedef struct arena {
-    char* start;
-    char* beg;
-    char* end;
+typedef struct arena_t {
+    uint8_t* start;
+    uint8_t* beg;
+    uint8_t* end;
     mem_profile_t* profile;
-} arena;
+    uint64_t flags;
+} arena_t;
 
 typedef struct mem_record_t {
     uint64_t in_use_space, in_use_objects, alloc_space, alloc_objects;
@@ -24,13 +26,15 @@ struct mem_profile_t {
     uint64_t records_len;
     uint64_t records_cap;
     uint64_t in_use_space, in_use_objects, alloc_space, alloc_objects;
-    arena* arena;
+    arena_t* arena;
 };
 
 #define new(a, t, n) (t*)alloc(a, sizeof(t), _Alignof(t), n)
 
-arena new_arena(ptrdiff_t cap, mem_profile_t* profile);
-void free_arena(arena* a);
-void* alloc(arena* a, ptrdiff_t size, ptrdiff_t alignment, ptrdiff_t count);
+arena_t new_arena(size_t cap, mem_profile_t* profile);
+void free_arena(arena_t* a);
+void* alloc(arena_t* a, size_t size, size_t alignment, size_t count);
+void mem_profile_write(mem_profile_t* profile, FILE* out);
+mem_profile_t new_mem_profile(arena_t* a);
 
 #endif
