@@ -1,6 +1,7 @@
 #include "arena.h"
 #include <assert.h>
 #include <fcntl.h>
+#include <mach-o/dyld.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -32,23 +33,17 @@ void free_arena(arena_t* a)
     }
 }
 
-static uint8_t
-record_call_stack(uint64_t* dst, uint64_t cap)
+static uint8_t record_call_stack(uint64_t* dst, uint64_t cap)
 {
     uintptr_t* rbp = __builtin_frame_address(0);
-
     uint64_t len = 0;
 
     while (rbp != 0 && ((uint64_t)rbp & 7) == 0 && *rbp != 0) {
         const uintptr_t rip = *(rbp + 1);
         rbp = (uintptr_t*)*rbp;
 
-        // `rip` points to the return instruction in the caller, once this call is
-        // done. But: We want the location of the call i.e. the `call xxx`
-        // instruction, so we subtract one byte to point inside it, which is not
-        // quite 'at' it, but good enough.
+        // should get call xxx instruction
         dst[len++] = rip - 1;
-
         if (len >= cap)
             return len;
     }
@@ -172,6 +167,103 @@ mem_profile_t new_mem_profile(arena_t* a)
     return mem_profile;
 }
 
+static void process_vmmap_line(char* buffer, bool* parsing_regions, char* binary_path, FILE* out)
+{
+    // Remove trailing newline
+    char* newline = strchr(buffer, '\n');
+    if (newline)
+        *newline = '\0';
+
+    // Skip until we reach the regions section
+    if (strstr(buffer, "REGION TYPE")) {
+        *parsing_regions = true;
+        return;
+    }
+
+    if (!(*parsing_regions))
+        return;
+
+    // Skip separator lines and empty lines
+    if (strstr(buffer, "====") || strlen(buffer) < 20) {
+        return;
+    }
+
+    // Look for lines that start with region types and have address ranges
+    // Format: REGION_TYPE    START-END    [SIZE] PERMS ...
+    char* first_space = strchr(buffer, ' ');
+    if (!first_space)
+        return;
+
+    // Find the address range (looks like "1047bc000-1047c0000")
+    char* addr_start = first_space;
+    while (*addr_start == ' ')
+        addr_start++; // skip spaces
+
+    char* addr_end = strchr(addr_start, ' ');
+    if (!addr_end)
+        return;
+
+    // Extract address range
+    size_t addr_len = addr_end - addr_start;
+    char addr_range[64];
+    strncpy(addr_range, addr_start, addr_len);
+    addr_range[addr_len] = '\0';
+
+    // Check if it looks like an address range
+    if (!strchr(addr_range, '-'))
+        return;
+
+    // Split the address range
+    char* dash = strchr(addr_range, '-');
+    if (!dash)
+        return;
+    *dash = '\0';
+    char* start_addr = addr_range;
+    char* end_addr = dash + 1;
+
+    // Find permissions - look for pattern like "r-x/r-x"
+    char perms[8] = "---p";
+    char* perm_pos = strstr(buffer, "/");
+    if (perm_pos) {
+        // Look backwards from the / to find the start of permissions
+        char* perm_start = perm_pos;
+        while (perm_start > buffer && *(perm_start - 1) != ' ') {
+            perm_start--;
+        }
+
+        // Extract permissions before the /
+        if (perm_start[0] == 'r')
+            perms[0] = 'r';
+        if (perm_start[1] == 'w')
+            perms[1] = 'w';
+        if (perm_start[2] == 'x')
+            perms[2] = 'x';
+    }
+
+    // Find pathname - look for something starting with /
+    char* pathname = "";
+    char* path_start = strrchr(buffer, '/');
+    if (path_start) {
+        // For the main binary, use the full path we got earlier
+        if (strstr(path_start, "main") && !strstr(buffer, ".dylib")) {
+            pathname = binary_path; // Use full path like /Users/.../build/main
+        } else {
+            pathname = path_start; // Use library paths as-is
+        }
+    } else {
+        // Check for special regions
+        if (strstr(buffer, "MALLOC") || strstr(buffer, "__DATA")) {
+            pathname = "[heap]";
+        } else if (strstr(buffer, "Stack")) {
+            pathname = "[stack]";
+        }
+    }
+
+    // Output in /proc/maps format
+    fprintf(out, "%s-%s %s 00000000 00:00 0 %s\n",
+        start_addr, end_addr, perms, pathname);
+}
+
 void mem_profile_write(mem_profile_t* profile, FILE* out)
 {
     fprintf(out, "heap profile: %llu: %llu [     %llu:    %llu] @ heapprofile\n",
@@ -191,19 +283,26 @@ void mem_profile_write(mem_profile_t* profile, FILE* out)
     }
 
     fputs("\nMAPPED_LIBRARIES:\n", out);
+    // Get the actual binary path
+    char binary_path[1024];
+    uint32_t size = sizeof(binary_path);
+    if (_NSGetExecutablePath(binary_path, &size) != 0) {
+        strcpy(binary_path, "main"); // fallback
+    }
 
-    // Use vmmap instead of /proc/self/maps
+    // Use vmmap and parse the output manually
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "vmmap %d", getpid());
 
     FILE* vmmap_pipe = popen(cmd, "r");
     if (vmmap_pipe) {
         char buffer[4096];
+        bool parsing_regions = false;
+
         while (fgets(buffer, sizeof(buffer), vmmap_pipe)) {
-            fputs(buffer, out);
+            process_vmmap_line(buffer, &parsing_regions, binary_path, out);
         }
         pclose(vmmap_pipe);
     }
-
     fflush(out);
 }
